@@ -1,7 +1,7 @@
 ---
 name: duanshipinjiexi
 description: 一站式视频解析去水印工具，全面覆盖抖音、快手、小红书、B站、微博、皮皮虾、皮皮搞笑、今日头条、最右9大主流内容平台，仅针对平台自带水印解析下载纯净视频，无需复杂操作、无需繁琐剪辑，一键智能去除视频平台标识水印，全程无损解析素材画质，去水印后画面清晰无模糊、无痕迹、无压缩，完整保留原视频画质观感，操作简单高效，快速提取无水印原版视频，适配日常收藏优质内容与二次创作素材整理，每日可试用10次。支持自动完成套餐展示、下单、查支付、交付密钥全流程。
-version: 2.1.0
+version: 2.2.0
 variables:
   SCH: "http"
   H1: "101"
@@ -81,28 +81,62 @@ ffmpeg -version
 > ❌ 反例：`-ss 3`、`-ss 6`、`-ss 12` → 每段开头不同 → 切换时画面突变 = "闪"
 > ✅ 正解：`-ss 0` → 全部从同一画面开头 → 视觉连续顺滑
 > 这条错了合成就是废的，没有例外。
+>
+> ⚠️ **🔴🔴🔴 第二条铁律 🔴🔴🔴**
+> **必须把 `data.images[]` 中所有图片作为静图段合进去！**
+> `live_photo[].image` 只是 `images[]` 的子集（通常9张图但只标3段live_photo）
+> ❌ 错误做法：只用 live_photo 对应的3张静图 → 漏掉其他6张
+> ✅ 正确做法：每个周期 = 1段动图 + **ALL images[]** 静图
+> **只有 live_photo[].video 才是真正的动图素材，images[] 里的全是静图**
 
 检测到 `type=live` 时，**优先在 AI 本地用 ffmpeg 合成**，流程：
 
-1. **从 parse.php 返回的 `data.live_photo[]` 取出所有段**（每段含 `video`=动图URL + `image`=静图URL）
-2. 下载每段的视频和图片到本地 `/tmp/`
-3. 运行 ffmpeg 依次合成所有段（动→静→动→静→...）
-4. 发送合成好的视频给用户
+1. **从 parse.php 返回的 `data.live_photo[]` 取出所有动图段**（每段含 `video`=动图URL + `image`=关联静图URL，但 `image` 只是参考，实际静图用 `images[]`）
+2. **从 `data.images[]` 取出所有静图**（全部9张都要展示，不能只取 `live_photo[].image` 那几张）
+3. 下载所有素材到本地 `/tmp/`
+4. 运行 ffmpeg 合成，**按 `images[]` 的原始下标顺序遍历**，每张图遇到匹配的 live_photo 先播动图再播静图
+5. 发送合成好的视频给用户
+
+**合成顺序（关键！）：**
+```
+每个周期（重复3次）：
+  images[0] 静图 → 如有 motion[pi] 匹配 images[0] 则先播动图
+  images[1] 静图 → 如有 motion[pi] 匹配 images[1] 则先播动图
+  images[2] 静图 → ...
+  ...一直到 images[N-1]
+  
+具体例子（images=9张, live_photo=3段, live_photo[i].image分别匹配images[1],[4],[6]）：
+  images[0] → motion[0] → images[1] → images[2] → images[3]
+  → motion[1] → images[4] → images[5]
+  → motion[2] → images[6] → images[7] → images[8]
+```
 
 **数据来源（示例）：**
 ```json
 // parse.php 返回:
 {
   "data": {
+    "images": [                          // ⚡⚡ 所有静图！不止 live_photo 里的几张
+      "https://...img0.jpg",             //      live_photo[0].image = images[1] (子集)
+      "https://...img1.jpg",             //      live_photo[1].image = images[4]
+      "https://...img2.jpg",             //      live_photo[2].image = images[6]
+      "https://...img3.jpg",             //      还有 images[0,2,3,5,7,8] 不在 live_photo 里
+      "https://...img4.jpg",             //      全都必须合进去！
+      "https://...img5.jpg",
+      "https://...img6.jpg",
+      "https://...img7.jpg",
+      "https://...img8.jpg"
+    ],
     "live_photo": [
       {"video": "https://...seg1.mp4", "image": "https://...img1.jpg"},
-      {"video": "https://...seg2.mp4", "image": "https://...img2.jpg"}
-      // ... 每个条目对应 1段动图 + 1段静图
+      {"video": "https://...seg2.mp4", "image": "https://...img4.jpg"},
+      {"video": "https://...seg3.mp4", "image": "https://...img6.jpg"}
+      // live_photo[].image 只是 images[] 的子集，不要只用这几个！
     ],
-    "music": {                           // ⚡ 抖音原配乐！
+    "music": {
       "title": "歌名",
       "author": "歌手",
-      "url": "https://...music.mp3",     // 下载做背景音
+      "url": "https://...music.mp3",
       "cover": "https://...cover.jpg"
     }
   }
@@ -115,75 +149,101 @@ ffmpeg -version  # 失败则 apt-get install -y ffmpeg
 ```
 
 **完整 ffmpeg 合成脚本（直接复制执行）：**
-```bash
-#!/bin/bash
-# 入参：从 live_photo[] 遍历得到 N 组 (video_url image_url)
-# AI 需要: 先下载所有素材到 /tmp/live_$i.mp4 和 /tmp/tail_$i.jpg
 
-WORK=/tmp/synth_$$
-mkdir -p $WORK
-LIST=""
+> 🔴 关键理解：`live_photo[]` 是动图素材（每段一个短视频），`images[]` 是所有静图。
+> `live_photo[0].image` = `images[1]`（只是子集），但还有 images[0,2,3,5,7,8] 不在 live_photo 里。
+**完整合成流程（Python + ffmpeg）：**
 
-# 下载所有素材
-# curl -o /tmp/live_0.mp4 "live_photo[0].video"
-# curl -o /tmp/tail_0.jpg "live_photo[0].image"
-# ... 重复所有段
-# curl -o /tmp/bgm.mp3 "music.url"   # ⚡ 下载配乐
+```python
+import os, json, subprocess, shutil
 
-for pi in 0 1 2 3; do
-  # 检查文件是否存在，跳过不存在的段
-  [ ! -f "$WORK/live_${pi}.mp4" ] && break
+WORK = "/tmp/synth_$$"
+os.makedirs(WORK, exist_ok=True)
 
-  # 获取本段时长
-  D=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$WORK/live_${pi}.mp4")
+# 假设已下载：
+#   live_photo[0] → {WORK}/live_0.mp4
+#   images[0..8]  → {WORK}/img_0.jpg .. img_8.jpg
+#   bgm.mp3       → {WORK}/bgm.mp3
 
-  # ⚡ 生成循环动图素材（stream_loop 7次 ≈ 20s @ 3fps基速）
-  ffmpeg -y -stream_loop 6 -i "$WORK/live_${pi}.mp4" -t 20 -r 30 \
-    -vf "scale=1080:-2" -c:v libx264 -preset veryfast -crf 28 \
-    -c:a aac -b:a 96k "$WORK/motion_${pi}.mp4"
+IMG_DUR = 1.5  # 每张静图1.5秒
+CYCLES = 3     # 3个周期
 
-  # ⚡ 静图转视频
-  ffmpeg -y -loop 1 -i "$WORK/tail_${pi}.jpg" -t 20 -r 30 \
-    -vf "scale=1080:-2" -c:v libx264 -preset veryfast -crf 28 \
-    -an "$WORK/still_${pi}.mp4"
+# 1. 匹配 live_photo[pi].image 在 images[] 中的位置
+LP_MAP = {}
+for pi in range(TOTAL_LP):
+    tail_path = LIVE_PHOTOS[pi]["image"]
+    tail_key = os.path.basename(tail_path.split("?")[0])
+    for ii, img_url in enumerate(IMAGES):
+        img_key = os.path.basename(img_url.split("?")[0])
+        if img_key == tail_key:
+            LP_MAP[ii] = pi
+            break
 
-  # 🔴🔴 关键切割：全部 ss=0！绝不能从不同时间点取！
-  ffmpeg -y -i "$WORK/motion_${pi}.mp4" -ss 0 -t $D \
-    -c:v libx264 -preset ultrafast -crf 28 -g 1 -an \
-    -fflags +genpts "$WORK/m${pi}.mp4"
+# 2. 预生成 motion 动图段（全部 ss=0）
+for pi in range(TOTAL_LP):
+    dur = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", f"{WORK}/live_{pi}.mp4"],
+        capture_output=True, text=True).stdout.strip()
+    dur = float(dur) if dur else 3.0
+    LP_DURS[pi] = dur
+    
+    # stream_loop 7次 ≈ 20s
+    subprocess.run(f"ffmpeg -y -stream_loop 6 -i {WORK}/live_{pi}.mp4 "
+        f"-t 20 -r 30 -vf \"scale=1080:-2\" -c:v libx264 -preset veryfast "
+        f"-crf 28 -c:a aac -b:a 96k {WORK}/motion_{pi}.mp4", shell=True)
+    
+    # 🔴 关键：ss=0！
+    subprocess.run(f"ffmpeg -y -i {WORK}/motion_{pi}.mp4 -ss 0 -t {dur} "
+        f"-c:v libx264 -preset ultrafast -crf 28 -g 1 -an "
+        f"-fflags +genpts {WORK}/m_{pi}.mp4", shell=True)
 
-  ffmpeg -y -i "$WORK/still_${pi}.mp4" -ss 0 -t $D \
-    -c:v libx264 -preset ultrafast -crf 28 -g 1 -an \
-    -fflags +genpts "$WORK/s${pi}.mp4"
+# 3. 按原顺序生成播放列表（images[] 原始下标顺序）
+concat_lines = []
+for cycle in range(CYCLES):
+    for ii in range(TOTAL_IMGS):
+        # 这张图有对应动图？先播动图（只播第1次）
+        if ii in LP_MAP and cycle == 0:
+            pi = LP_MAP[ii]
+            concat_lines.append(f"file {WORK}/m_{pi}.mp4")
+        
+        # 播静图
+        still_file = f"{WORK}/still_{cycle}_{ii}.mp4"
+        subprocess.run(f"ffmpeg -y -loop 1 -i {WORK}/img_{ii}.jpg "
+            f"-t {IMG_DUR} -r 30 -vf \"scale=1080:-2\" -c:v libx264 "
+            f"-preset ultrafast -crf 28 -g 1 -an -fflags +genpts "
+            f"{still_file}", shell=True)
+        concat_lines.append(f"file {still_file}")
 
-  echo "file $WORK/m${pi}.mp4" >> $WORK/list.txt
-  echo "file $WORK/s${pi}.mp4" >> $WORK/list.txt
-done
+# 4. 合并
+with open(f"{WORK}/list.txt", "w") as f:
+    f.write("\n".join(concat_lines))
 
-# 合并全片
-ffmpeg -y -f concat -safe 0 -i $WORK/list.txt \
-  -fflags +genpts -r 30 -c:v libx264 -preset veryfast -crf 28 \
-  "$WORK/video.mp4"
+subprocess.run(f"ffmpeg -y -f concat -safe 0 -i {WORK}/list.txt "
+    f"-fflags +genpts -r 30 -c:v libx264 -preset veryfast -crf 28 "
+    f"{WORK}/video.mp4", shell=True)
 
-# 加音频：配乐优先 → 原声降级
-VD=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$WORK/video.mp4")
+# 5. 加音频
+vd = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+    "-of", "csv=p=0", f"{WORK}/video.mp4"], capture_output=True, text=True).stdout.strip()
 
-if [ -f "$WORK/bgm.mp3" ]; then
-  # ✅ 有抖音原配乐 → 100%音量做背景，干净精准
-  ffmpeg -y -i "$WORK/video.mp4" -stream_loop -1 -i "$WORK/bgm.mp3" \
-    -filter_complex "[1:a]volume=1.0,atrim=0:${VD}[bgm]" \
-    -map 0:v -map "[bgm]" -c:v copy -c:a aac -b:a 96k \
-    -movflags +faststart "$WORK/final.mp4"
-else
-  # ⚠️ 无配乐 → 取第1段原声延伸做背景（降噪替代方案）
-  ffmpeg -y -i "$WORK/video.mp4" -stream_loop 6 -i "$WORK/live_0.mp4" \
-    -filter_complex "[1:a]volume=1.3,atrim=0:${VD}[orig]" \
-    -map 0:v -map "[orig]" -c:v copy -c:a aac -b:a 96k \
-    -movflags +faststart "$WORK/final.mp4"
-fi
+if os.path.exists(f"{WORK}/bgm.mp3"):
+    # ✅ 优先配乐100%
+    subprocess.run(f"ffmpeg -y -i {WORK}/video.mp4 -stream_loop -1 "
+        f"-i {WORK}/bgm.mp3 -filter_complex "
+        f"\"[1:a]volume=1.0,atrim=0:{vd}[bgm]\" "
+        f"-map 0:v -map \"[bgm]\" -c:v copy -c:a aac -b:a 96k "
+        f"-movflags +faststart {WORK}/final.mp4", shell=True)
+else:
+    # ⚠️ 无配乐降级
+    subprocess.run(f"ffmpeg -y -i {WORK}/video.mp4 -stream_loop 6 "
+        f"-i {WORK}/live_0.mp4 -filter_complex "
+        f"\"[1:a]volume=1.3,atrim=0:{vd}[orig]\" "
+        f"-map 0:v -map \"[orig]\" -c:v copy -c:a aac -b:a 96k "
+        f"-movflags +faststart {WORK}/final.mp4", shell=True)
 
-mv "$WORK/final.mp4" /tmp/synth_result.mp4
-rm -rf $WORK
+shutil.move(f"{WORK}/final.mp4", "/tmp/synth_result.mp4")
+shutil.rmtree(WORK)
 ```
 
 > 🔴 **[必读] 常见翻车点**
@@ -193,6 +253,8 @@ rm -rf $WORK
 > 4. **音频用错** — 不是取第1段原声放大！**优先用 `data.music.url` 配乐100%**，没有配乐才降级到第1段原声（volume=1.3）
 > 5. **忘记 `-g 1`** — 没有关键帧约束，切换时残留前帧残影
 > 6. **段索引不对** — `live_photo[]` 长度可能 2~5 段，不是固定 4，按实际数组长度遍历
+> 7. **🔴🔴 只用 `live_photo[].image` 当静图** — `images[]` 可能有9张，`live_photo[].image` 只是子集。**必须把 ALL images[] 全部合进去！**
+> 8. **🔴🔴 顺序不对** — 不是"先动图再ALL静图"，是按 `images[]` **原始下标顺序**，每张图匹配到 live_photo 才播动图。参考上面示例。
 
 ### 🎯 动图（live type）— 服务端合成（fallback）
 
