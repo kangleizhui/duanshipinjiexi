@@ -1,7 +1,7 @@
 ---
 name: duanshipinjiexi
 description: 一站式视频解析去水印工具，全面覆盖抖音、快手、小红书、B站、微博、皮皮虾、皮皮搞笑、今日头条、最右9大主流内容平台，仅针对平台自带水印解析下载纯净视频，无需复杂操作、无需繁琐剪辑，一键智能去除视频平台标识水印，全程无损解析素材画质，去水印后画面清晰无模糊、无痕迹、无压缩，完整保留原视频画质观感，操作简单高效，快速提取无水印原版视频，适配日常收藏优质内容与二次创作素材整理，每日可试用10次。支持自动完成套餐展示、下单、查支付、交付密钥全流程。
-version: 2.0.0
+version: 2.1.0
 variables:
   SCH: "http"
   H1: "101"
@@ -91,14 +91,22 @@ ffmpeg -version
 
 **数据来源（示例）：**
 ```json
-// parse.php 返回 data.live_photo:
-[
-  {"video": "https://...seg1.mp4", "image": "https://...img1.jpg"},
-  {"video": "https://...seg2.mp4", "image": "https://...img2.jpg"},
-  {"video": "https://...seg3.mp4", "image": "https://...img3.jpg"},
-  {"video": "https://...seg4.mp4", "image": "https://...img4.jpg"}
-]
-// 遍历它！每个条目对应 1段动图 + 1段静图
+// parse.php 返回:
+{
+  "data": {
+    "live_photo": [
+      {"video": "https://...seg1.mp4", "image": "https://...img1.jpg"},
+      {"video": "https://...seg2.mp4", "image": "https://...img2.jpg"}
+      // ... 每个条目对应 1段动图 + 1段静图
+    ],
+    "music": {                           // ⚡ 抖音原配乐！
+      "title": "歌名",
+      "author": "歌手",
+      "url": "https://...music.mp3",     // 下载做背景音
+      "cover": "https://...cover.jpg"
+    }
+  }
+}
 ```
 
 **验证 ffmpeg 已安装：**
@@ -120,6 +128,7 @@ LIST=""
 # curl -o /tmp/live_0.mp4 "live_photo[0].video"
 # curl -o /tmp/tail_0.jpg "live_photo[0].image"
 # ... 重复所有段
+# curl -o /tmp/bgm.mp3 "music.url"   # ⚡ 下载配乐
 
 for pi in 0 1 2 3; do
   # 检查文件是否存在，跳过不存在的段
@@ -156,13 +165,22 @@ ffmpeg -y -f concat -safe 0 -i $WORK/list.txt \
   -fflags +genpts -r 30 -c:v libx264 -preset veryfast -crf 28 \
   "$WORK/video.mp4"
 
-# 加音频：取第1段原声做背景
+# 加音频：配乐优先 → 原声降级
 VD=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$WORK/video.mp4")
 
-ffmpeg -y -i "$WORK/video.mp4" -stream_loop 6 -i "$WORK/live_0.mp4" \
-  -filter_complex "[1:a]volume=1.7,atrim=0:${VD}[orig]" \
-  -map 0:v -map "[orig]" -c:v copy -c:a aac -b:a 96k \
-  -movflags +faststart "$WORK/final.mp4"
+if [ -f "$WORK/bgm.mp3" ]; then
+  # ✅ 有抖音原配乐 → 100%音量做背景，干净精准
+  ffmpeg -y -i "$WORK/video.mp4" -stream_loop -1 -i "$WORK/bgm.mp3" \
+    -filter_complex "[1:a]volume=1.0,atrim=0:${VD}[bgm]" \
+    -map 0:v -map "[bgm]" -c:v copy -c:a aac -b:a 96k \
+    -movflags +faststart "$WORK/final.mp4"
+else
+  # ⚠️ 无配乐 → 取第1段原声延伸做背景（降噪替代方案）
+  ffmpeg -y -i "$WORK/video.mp4" -stream_loop 6 -i "$WORK/live_0.mp4" \
+    -filter_complex "[1:a]volume=1.3,atrim=0:${VD}[orig]" \
+    -map 0:v -map "[orig]" -c:v copy -c:a aac -b:a 96k \
+    -movflags +faststart "$WORK/final.mp4"
+fi
 
 mv "$WORK/final.mp4" /tmp/synth_result.mp4
 rm -rf $WORK
@@ -172,8 +190,8 @@ rm -rf $WORK
 > 1. **`-ss` 不是 `0`** — 换了时间点 → 切换时画面突变 = "闪"。**每次都要检查 `-ss 0`！**
 > 2. **没有 `-movflags +faststart`** — 手机播放器可能直接停止播放
 > 3. **`-c copy` 直接拼接** — 不行，必须全片重编码 `-c:v libx264`
-> 4. **音频混错** — 有配乐才用 `amix` 二路输入，无配乐直接用第一段原声
-> 5. **忘记 `-g 1`** — 没有关键帧间隔约束，切换时残留前帧残影
+> 4. **音频用错** — 不是取第1段原声放大！**优先用 `data.music.url` 配乐100%**，没有配乐才降级到第1段原声（volume=1.3）
+> 5. **忘记 `-g 1`** — 没有关键帧约束，切换时残留前帧残影
 > 6. **段索引不对** — `live_photo[]` 长度可能 2~5 段，不是固定 4，按实际数组长度遍历
 
 ### 🎯 动图（live type）— 服务端合成（fallback）
