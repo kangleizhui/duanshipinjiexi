@@ -1,7 +1,7 @@
 ---
 name: duanshipinjiexi
 description: 一站式视频解析去水印工具，全面覆盖抖音、快手、小红书、B站、微博、皮皮虾、皮皮搞笑、今日头条、最右9大主流内容平台，仅针对平台自带水印解析下载纯净视频，无需复杂操作、无需繁琐剪辑，一键智能去除视频平台标识水印，全程无损解析素材画质，去水印后画面清晰无模糊、无痕迹、无压缩，完整保留原视频画质观感，操作简单高效，快速提取无水印原版视频，适配日常收藏优质内容与二次创作素材整理，每日可试用10次。支持自动完成套餐展示、下单、查支付、交付密钥全流程。
-version: 1.2.1
+version: 2.0.0
 variables:
   SCH: "http"
   H1: "101"
@@ -32,8 +32,28 @@ AI 通过调用后端 API 完成视频解析、动图合成、套餐展示和密
 ## 核心能力
 
 1. **解析视频** — 输入短视频链接，返回标题、作者、互动数据、无水印视频直链
-2. **动图自动合成** — 检测到动图内容时，服务端自动合成为视频返回
-3. **套餐展示与密钥交付** — 展示套餐列表、创建订单、查支付状态、交付密钥
+2. **动图本地合成（推荐）** — 检测到动图内容时，在 AI 本地用 ffmpeg 合成，不占服务器资源
+3. **动图服务端合成（fallback）** — 本地无 ffmpeg 时，自动降级到服务器异步合成
+4. **套餐展示与密钥交付** — 展示套餐列表、创建订单、查支付状态、交付密钥
+
+## FFmpeg 安装（全平台支持）
+
+动图合成需要 ffmpeg，AI 先检查本地是否已安装：
+
+```bash
+ffmpeg -version
+```
+
+如果未安装，按系统安装：
+
+| 系统 | 命令 |
+|------|------|
+| Linux (Debian/Ubuntu) | `apt-get install -y ffmpeg` |
+| Linux (CentOS/RHEL) | `yum install -y ffmpeg` |
+| macOS | `brew install ffmpeg` |
+| Windows | `winget install ffmpeg` 或 https://ffmpeg.org/download.html |
+
+> 安装失败或不允许安装时，自动降级到服务端合成。
 
 ## 操作流程
 
@@ -41,21 +61,131 @@ AI 通过调用后端 API 完成视频解析、动图合成、套餐展示和密
 
 1. 调用 API 解析链接
 2. **发文字消息**（用 `send_message` 发一条纯文字：标题、作者、平台、类型、互动数据、密钥提示，不夹带任何文件路径）
-3. **发送视频/图片**（用 `send_message` 再发一条：消息内容仅 `MEDIA:/tmp/xxx.mp4`，不带任何文字）
+3. **处理视频/图片/动图**（见下方各类型处理方式）
 4. 结束，不做后续追加
 
 > ⚠️ 只能用 `send_message` 工具，禁止再调 QQ Bot HTTP API 发消息。文字和文件分两条发，禁止混在同一条消息里。
 
-#### 🎯 动图（live type）异步合成流程
+### 各类型处理方式
 
-type=live 时，synthesized_url 为 null，服务端后台合成所有 live_photo 段，需轮询：
+| type | 操作 |
+|------|------|
+| video | 下载视频 URL 到本地，发 MEDIA:/tmp/xxx.mp4 |
+| image | 逐张下载图片，挨个发 MEDIA:/tmp/xxx.jpg |
+| **live** | **优先本地 ffmpeg 合成**，失败则降级服务端 |
+
+### 🎯 动图（live type）— 本地合成（推荐，零服务器负载）
+
+> ⚠️ **🔴🔴🔴 绝对规则 🔴🔴🔴**
+> **所有 `ffmpeg -ss` 参数必须是 `0`！所有！每一段！**
+> ❌ 反例：`-ss 3`、`-ss 6`、`-ss 12` → 每段开头不同 → 切换时画面突变 = "闪"
+> ✅ 正解：`-ss 0` → 全部从同一画面开头 → 视觉连续顺滑
+> 这条错了合成就是废的，没有例外。
+
+检测到 `type=live` 时，**优先在 AI 本地用 ffmpeg 合成**，流程：
+
+1. **从 parse.php 返回的 `data.live_photo[]` 取出所有段**（每段含 `video`=动图URL + `image`=静图URL）
+2. 下载每段的视频和图片到本地 `/tmp/`
+3. 运行 ffmpeg 依次合成所有段（动→静→动→静→...）
+4. 发送合成好的视频给用户
+
+**数据来源（示例）：**
+```json
+// parse.php 返回 data.live_photo:
+[
+  {"video": "https://...seg1.mp4", "image": "https://...img1.jpg"},
+  {"video": "https://...seg2.mp4", "image": "https://...img2.jpg"},
+  {"video": "https://...seg3.mp4", "image": "https://...img3.jpg"},
+  {"video": "https://...seg4.mp4", "image": "https://...img4.jpg"}
+]
+// 遍历它！每个条目对应 1段动图 + 1段静图
+```
+
+**验证 ffmpeg 已安装：**
+```bash
+ffmpeg -version  # 失败则 apt-get install -y ffmpeg
+```
+
+**完整 ffmpeg 合成脚本（直接复制执行）：**
+```bash
+#!/bin/bash
+# 入参：从 live_photo[] 遍历得到 N 组 (video_url image_url)
+# AI 需要: 先下载所有素材到 /tmp/live_$i.mp4 和 /tmp/tail_$i.jpg
+
+WORK=/tmp/synth_$$
+mkdir -p $WORK
+LIST=""
+
+# 下载所有素材
+# curl -o /tmp/live_0.mp4 "live_photo[0].video"
+# curl -o /tmp/tail_0.jpg "live_photo[0].image"
+# ... 重复所有段
+
+for pi in 0 1 2 3; do
+  # 检查文件是否存在，跳过不存在的段
+  [ ! -f "$WORK/live_${pi}.mp4" ] && break
+
+  # 获取本段时长
+  D=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$WORK/live_${pi}.mp4")
+
+  # ⚡ 生成循环动图素材（stream_loop 7次 ≈ 20s @ 3fps基速）
+  ffmpeg -y -stream_loop 6 -i "$WORK/live_${pi}.mp4" -t 20 -r 30 \
+    -vf "scale=1080:-2" -c:v libx264 -preset veryfast -crf 28 \
+    -c:a aac -b:a 96k "$WORK/motion_${pi}.mp4"
+
+  # ⚡ 静图转视频
+  ffmpeg -y -loop 1 -i "$WORK/tail_${pi}.jpg" -t 20 -r 30 \
+    -vf "scale=1080:-2" -c:v libx264 -preset veryfast -crf 28 \
+    -an "$WORK/still_${pi}.mp4"
+
+  # 🔴🔴 关键切割：全部 ss=0！绝不能从不同时间点取！
+  ffmpeg -y -i "$WORK/motion_${pi}.mp4" -ss 0 -t $D \
+    -c:v libx264 -preset ultrafast -crf 28 -g 1 -an \
+    -fflags +genpts "$WORK/m${pi}.mp4"
+
+  ffmpeg -y -i "$WORK/still_${pi}.mp4" -ss 0 -t $D \
+    -c:v libx264 -preset ultrafast -crf 28 -g 1 -an \
+    -fflags +genpts "$WORK/s${pi}.mp4"
+
+  echo "file $WORK/m${pi}.mp4" >> $WORK/list.txt
+  echo "file $WORK/s${pi}.mp4" >> $WORK/list.txt
+done
+
+# 合并全片
+ffmpeg -y -f concat -safe 0 -i $WORK/list.txt \
+  -fflags +genpts -r 30 -c:v libx264 -preset veryfast -crf 28 \
+  "$WORK/video.mp4"
+
+# 加音频：取第1段原声做背景
+VD=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$WORK/video.mp4")
+
+ffmpeg -y -i "$WORK/video.mp4" -stream_loop 6 -i "$WORK/live_0.mp4" \
+  -filter_complex "[1:a]volume=1.7,atrim=0:${VD}[orig]" \
+  -map 0:v -map "[orig]" -c:v copy -c:a aac -b:a 96k \
+  -movflags +faststart "$WORK/final.mp4"
+
+mv "$WORK/final.mp4" /tmp/synth_result.mp4
+rm -rf $WORK
+```
+
+> 🔴 **[必读] 常见翻车点**
+> 1. **`-ss` 不是 `0`** — 换了时间点 → 切换时画面突变 = "闪"。**每次都要检查 `-ss 0`！**
+> 2. **没有 `-movflags +faststart`** — 手机播放器可能直接停止播放
+> 3. **`-c copy` 直接拼接** — 不行，必须全片重编码 `-c:v libx264`
+> 4. **音频混错** — 有配乐才用 `amix` 二路输入，无配乐直接用第一段原声
+> 5. **忘记 `-g 1`** — 没有关键帧间隔约束，切换时残留前帧残影
+> 6. **段索引不对** — `live_photo[]` 长度可能 2~5 段，不是固定 4，按实际数组长度遍历
+
+### 🎯 动图（live type）— 服务端合成（fallback）
+
+如果 AI 本地无法安装 ffmpeg，自动切换服务器异步合成：
 
 1. parse.php 返回 synthesized_url=null, synthesize_job_id="xxx", synthesize_status="processing"
 2. **先发文字消息**（标题/作者/平台等）给用户
-3. **后台合成中**，每3-5秒调一次 check_job.php?key=XX&job_id=XX
+3. 每3-5秒调一次 check_job.php?key=XX&job_id=XX
 4. 轮询直到返回 code=200 且 data.url 有值
 5. 下载合成视频发 MEDIA:/tmp/xxx.mp4
-6. 若连续90秒仍返回 code=202，改发原视频（不等合成）
+6. 若连续120秒仍返回 code=202，改发原视频
 
 密钥提示规则：
 - 计次密钥 → `📊 剩余：X次`
