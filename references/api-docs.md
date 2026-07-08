@@ -139,7 +139,37 @@ GET {SCH}://{H1}.{H2}.{H3}.{H4}:{AP}/pay/query.php?order_id=SV20260707XXXX
 **已支付：** status=paid, api_key 有值
 **未支付：** status=pending, api_key=null
 
-## 4. 套餐数据
+## 5. key_info 字段说明
+
+每次解析响应都附带 `key_info`，**AI 直接读它做密钥提示，不用自己算：**
+
+```json
+// 测试密钥（每IP每天10次）
+{"is_test": true, "daily_remaining": 8}
+  → "📊 今日免费剩余：8次（每IP每天10次）"
+
+// 计次密钥
+{"is_test": false, "remaining": 42}
+  → "📊 剩余：42次"
+
+// 时长/永久密钥
+{"is_test": false, "remaining": null}
+  → 不显示剩余
+
+// 免费已用完
+{"is_test": true, "daily_remaining": 0}
+  → "📊 今日免费次数已用完，明天再试"
+```
+
+| 字段 | 说明 |
+|------|------|
+| `is_test` | true=测试密钥，false=付费密钥 |
+| `remaining` | 计次密钥剩余次数（null=无限或测试密钥） |
+| `daily_remaining` | 今日剩余次数（仅测试密钥和每日限额密钥有值） |
+| `type` | count/monthly/daily/lifetime |
+| `expires_at` | 过期时间（null=永不过期） |
+
+> 🔴 **AI 常见错误：** 看到 `is_test=true` 就去算 `used` 字段（全局总调用次数）→ **错！看 `daily_remaining`，那才是你今天还能用的次数。**
 
 ```json
 [
